@@ -4,6 +4,8 @@ import re
 import json
 from datetime import datetime
 import time
+from fpdf import FPDF
+import io
 
 # Intentar importar Gemini
 try:
@@ -36,12 +38,16 @@ def extraer_texto_pdf(archivo_pdf):
         st.error(f"Error al leer el PDF: {e}")
         return None, 0
 
-# ----------------------------------------------------------------------
-# Funciones de extracción por regex (mantenidas del código original)
-# ----------------------------------------------------------------------
-# ... (aquí van todas las funciones de extracción: extraer_paciente, extraer_servicios, etc.)
-# Por brevedad, no las repito, pero deben estar incluidas.
+def formatear_fecha(fecha_str):
+    """Convierte fecha DD/MM/AAAA a AAAA-MM-DD para ordenamiento."""
+    try:
+        return datetime.strptime(fecha_str, '%d/%m/%Y').date().isoformat()
+    except:
+        return fecha_str
 
+# ----------------------------------------------------------------------
+# Funciones de extracción mejoradas (completas)
+# ----------------------------------------------------------------------
 def extraer_paciente(texto):
     """Extrae datos básicos del paciente."""
     paciente = {}
@@ -66,6 +72,7 @@ def extraer_paciente(texto):
     return paciente
 
 def extraer_servicios(texto):
+    """Extrae todos los registros de atención (ingresos a servicios)."""
     servicios = []
     pattern = r'SEDE DE ATENCION\s+(\d+)\s+([^\n]+?)\s+FOLIO\s+\d+\s+FECHA\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})\s+TIPO DE ATENCION\s*:\s*([^\n]+)'
     for match in re.finditer(pattern, texto, re.IGNORECASE):
@@ -79,6 +86,7 @@ def extraer_servicios(texto):
     return servicios
 
 def extraer_diagnosticos(texto):
+    """Extrae diagnósticos con códigos CIE-10."""
     diagnosticos = []
     patron = r'(?:DIAGN[OÓ]STICO|DX|DIAGN[OÓ]STICOS?)\s*:?\s*([A-Z0-9]+\s+[^\n]+)'
     for match in re.finditer(patron, texto, re.IGNORECASE):
@@ -91,36 +99,323 @@ def extraer_diagnosticos(texto):
     return diagnosticos
 
 def extraer_medicamentos(texto):
-    # ... (mantener implementación original)
-    return []  # Placeholder
+    """
+    Extrae medicamentos de:
+    - FORMULA MEDICA ESTANDAR
+    - CONCILIACIÓN MEDICAMENTOSA
+    - PLAN TERAPEUTICO (listados de medicamentos)
+    """
+    medicamentos = []
+
+    def procesar_linea_med(linea):
+        partes = linea.strip().split(maxsplit=1)
+        if len(partes) < 2:
+            return None
+        cantidad = partes[0] if re.match(r'^\d+\.?\d*$', partes[0]) else '1'
+        desc = partes[1]
+        dosis_match = re.search(r'(\d+[.,]?\d*\s*(?:MG|ML|G|MCG|UI))', desc, re.IGNORECASE)
+        dosis = dosis_match.group(1) if dosis_match else ''
+        return {
+            'cantidad': cantidad,
+            'descripcion': desc,
+            'dosis': dosis,
+            'frecuencia': '',
+            'via': '',
+            'estado': ''
+        }
+
+    # 1. Bloques FORMULA MEDICA ESTANDAR
+    bloques_fm = re.split(r'FORMULA MEDICA ESTANDAR', texto)
+    for bloque in bloques_fm[1:]:
+        fin = re.search(r'\n[A-Z ]{5,}\n', bloque)
+        if fin:
+            bloque = bloque[:fin.start()]
+        lineas = bloque.split('\n')
+        i = 0
+        while i < len(lineas):
+            linea = lineas[i].strip()
+            if not linea:
+                i += 1
+                continue
+            if re.match(r'^\s*\d+\.?\d*\s+[A-Za-z0-9]', linea):
+                med = procesar_linea_med(linea)
+                if med:
+                    for j in range(i, min(i+5, len(lineas))):
+                        if 'Frecuencia' in lineas[j]:
+                            med['frecuencia'] = lineas[j].strip()
+                        if 'Via' in lineas[j]:
+                            med['via'] = lineas[j].strip()
+                        if 'Estado:' in lineas[j]:
+                            med['estado'] = lineas[j].strip()
+                    medicamentos.append(med)
+            i += 1
+
+    # 2. Bloques CONCILIACIÓN MEDICAMENTOSA
+    bloques_conc = re.split(r'CONCILIACI[OÓ]N MEDICAMENTOSA', texto, re.IGNORECASE)
+    for bloque in bloques_conc[1:]:
+        fin = re.search(r'\n[A-Z ]{5,}\n', bloque)
+        if fin:
+            bloque = bloque[:fin.start()]
+        lineas = bloque.split('\n')
+        for linea in lineas:
+            linea = linea.strip()
+            if not linea:
+                continue
+            if re.search(r'\d+\s*(?:MG|ML|G|MCG)', linea, re.IGNORECASE):
+                med = {
+                    'cantidad': '1',
+                    'descripcion': linea,
+                    'dosis': '',
+                    'frecuencia': '',
+                    'via': '',
+                    'estado': ''
+                }
+                dosis_match = re.search(r'(\d+[.,]?\d*\s*(?:MG|ML|G|MCG))', linea, re.IGNORECASE)
+                if dosis_match:
+                    med['dosis'] = dosis_match.group(1)
+                via_match = re.search(r'\b(VO|IV|SC|IM|ORAL|INTRAVENOSO|SUBCUTANEA)\b', linea, re.IGNORECASE)
+                if via_match:
+                    med['via'] = via_match.group(1)
+                freq_match = re.search(r'(CADA\s+\d+\s+HORAS|CADA\s+\d+H|CADA\s+\d+\s+DÍAS?|DIARIO|UNA\s+VEZ\s+AL\s+DÍA)', linea, re.IGNORECASE)
+                if freq_match:
+                    med['frecuencia'] = freq_match.group(1)
+                medicamentos.append(med)
+
+    # 3. PLAN - TERAPEUTICO (líneas con guiones)
+    bloques_plan = re.split(r'PLAN\s*[-:]?\s*TERAPEUTICO', texto, re.IGNORECASE)
+    for bloque in bloques_plan[1:]:
+        fin = re.search(r'\n[A-Z ]{5,}\n', bloque)
+        if fin:
+            bloque = bloque[:fin.start()]
+        lineas = bloque.split('\n')
+        for linea in lineas:
+            linea = linea.strip()
+            if not linea or not linea.startswith('-'):
+                continue
+            linea = linea[1:].strip()
+            if re.search(r'\d+\s*(?:MG|ML|G|MCG)', linea, re.IGNORECASE):
+                med = {
+                    'cantidad': '1',
+                    'descripcion': linea,
+                    'dosis': '',
+                    'frecuencia': '',
+                    'via': '',
+                    'estado': ''
+                }
+                dosis_match = re.search(r'(\d+[.,]?\d*\s*(?:MG|ML|G|MCG))', linea, re.IGNORECASE)
+                if dosis_match:
+                    med['dosis'] = dosis_match.group(1)
+                via_match = re.search(r'\b(VO|IV|SC|IM|ORAL|INTRAVENOSO|SUBCUTANEA)\b', linea, re.IGNORECASE)
+                if via_match:
+                    med['via'] = via_match.group(1)
+                freq_match = re.search(r'(CADA\s+\d+\s+HORAS|CADA\s+\d+H|CADA\s+\d+\s+DÍAS?|DIARIO|UNA\s+VEZ\s+AL\s+DÍA)', linea, re.IGNORECASE)
+                if freq_match:
+                    med['frecuencia'] = freq_match.group(1)
+                medicamentos.append(med)
+
+    return medicamentos
 
 def extraer_procedimientos(texto):
-    # ... (mantener)
-    return []
+    """Extrae procedimientos quirúrgicos y no quirúrgicos con fechas."""
+    procedimientos = []
+
+    pattern_qx = r'PROCEDIMIENTOS QUIRURGICOS\s*\n\s*(\d+)\s+([^\n]+)'
+    for match in re.finditer(pattern_qx, texto, re.IGNORECASE):
+        procedimientos.append({
+            'tipo': 'quirurgico',
+            'cantidad': match.group(1).strip(),
+            'descripcion': match.group(2).strip(),
+            'fecha': None
+        })
+
+    pattern_noqx = r'ORDENES DE PROCEDIMIENTOS NO QX\s*\n\s*(\d+)\s+([^\n]+)'
+    for match in re.finditer(pattern_noqx, texto, re.IGNORECASE):
+        procedimientos.append({
+            'tipo': 'no_quirurgico',
+            'cantidad': match.group(1).strip(),
+            'descripcion': match.group(2).strip(),
+            'fecha': None
+        })
+
+    for proc in procedimientos:
+        desc = proc['descripcion']
+        idx = texto.find(desc)
+        if idx != -1:
+            ventana = texto[max(0, idx-200):idx+200]
+            fecha_match = re.search(r'Fecha y Hora de Aplicación:(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})', ventana)
+            if fecha_match:
+                proc['fecha'] = fecha_match.group(1)
+                proc['hora'] = fecha_match.group(2)
+
+    return procedimientos
 
 def extraer_cirugias(texto):
-    # ... (mantener)
-    return []
+    """Extrae información detallada de cirugías (descripciones, participantes, etc.)"""
+    cirugias = []
+    patron = r'DESCRIPCION CIRUGIA.*?(?=\n[A-Z]{5,}\n|\Z)'
+    for bloque in re.finditer(patron, texto, re.DOTALL | re.IGNORECASE):
+        bloque_texto = bloque.group(0)
+        cirugia = {}
+
+        pre = re.search(r'Diagnostico Preoperatorio:\s*([^\n]+)', bloque_texto)
+        if pre:
+            cirugia['diagnostico_pre'] = pre.group(1).strip()
+        post = re.search(r'Diagnostico Postoperatorio:\s*([^\n]+)', bloque_texto)
+        if post:
+            cirugia['diagnostico_post'] = post.group(1).strip()
+        anest = re.search(r'Tipo de Anestesia:\s*([^\n]+)', bloque_texto)
+        if anest:
+            cirugia['anestesia'] = anest.group(1).strip()
+        fecha = re.search(r'Realizacion Acto Quirurgico:\s*(\d{2}/\d{2}/\d{4})', bloque_texto)
+        if fecha:
+            cirugia['fecha'] = fecha.group(1)
+        hora_inicio = re.search(r'Hora Inicio\s*(\d{2}:\d{2}:\d{2})', bloque_texto)
+        if hora_inicio:
+            cirugia['hora_inicio'] = hora_inicio.group(1)
+        hora_fin = re.search(r'Hora Final\s*(\d{2}:\d{2}:\d{2})', bloque_texto)
+        if hora_fin:
+            cirugia['hora_fin'] = hora_fin.group(1)
+        desc = re.search(r'Descripcion Quirurgica:\s*(.*?)(?=\nComplicacion:|\Z)', bloque_texto, re.DOTALL)
+        if desc:
+            cirugia['descripcion'] = desc.group(1).strip().replace('\n', ' ')
+        tej = re.search(r'Tejidos enviados a patología\s*:\s*(.*?)(?=\n|$)', bloque_texto)
+        if tej:
+            cirugia['tejidos_patologia'] = tej.group(1).strip()
+        participantes = re.findall(r'CÓDIGO\s+([^\n]+)\n\s*([^\n]+)\s+TIPO\s+([^\n]+)\s+PARTICIPO\?\s*([^\n]+)', bloque_texto)
+        if participantes:
+            cirugia['participantes'] = [{'codigo': p[0], 'nombre': p[1], 'tipo': p[2], 'participo': p[3]} for p in participantes]
+
+        if cirugia:
+            cirugias.append(cirugia)
+
+    return cirugias
 
 def extraer_laboratorios(texto):
-    # ... (mantener)
-    return []
+    """Extrae órdenes de laboratorio y resultados."""
+    laboratorios = []
+    bloques = re.split(r'ORDENES DE LABORATORIO', texto)
+    for bloque in bloques[1:]:
+        fin = re.search(r'\n[A-Z ]{5,}\n', bloque)
+        if fin:
+            bloque = bloque[:fin.start()]
+        lineas = bloque.split('\n')
+        i = 0
+        while i < len(lineas):
+            linea = lineas[i].strip()
+            if not linea:
+                i += 1
+                continue
+            if re.match(r'^\s*\d+\s+[A-Za-z]', linea):
+                partes = linea.split(maxsplit=1)
+                if len(partes) == 2:
+                    lab = {
+                        'cantidad': partes[0].strip(),
+                        'descripcion': partes[1].strip(),
+                        'fecha': None,
+                        'resultado': None
+                    }
+                    for j in range(i, min(i+5, len(lineas))):
+                        if 'Fecha y Hora de Aplicación' in lineas[j]:
+                            fecha_match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})', lineas[j])
+                            if fecha_match:
+                                lab['fecha'] = fecha_match.group(1)
+                                lab['hora'] = fecha_match.group(2)
+                        if 'Resultados:' in lineas[j]:
+                            k = j+1
+                            resultados = []
+                            while k < len(lineas) and not re.match(r'^\s*\d+\s+[A-Za-z]', lineas[k]) and not re.match(r'\n[A-Z ]{5,}\n', lineas[k]):
+                                res_linea = lineas[k].strip()
+                                if res_linea:
+                                    resultados.append(res_linea)
+                                k += 1
+                            if resultados:
+                                lab['resultado'] = ' '.join(resultados)
+                            break
+                    laboratorios.append(lab)
+            i += 1
+    return laboratorios
 
 def extraer_imagenes(texto):
-    # ... (mantener)
-    return []
+    """Extrae órdenes de imágenes diagnósticas y sus informes."""
+    imagenes = []
+    bloques = re.split(r'ORDENES DE IMAGENES DIAGNOSTICAS', texto)
+    for bloque in bloques[1:]:
+        fin = re.search(r'\n[A-Z ]{5,}\n', bloque)
+        if fin:
+            bloque = bloque[:fin.start()]
+        lineas = bloque.split('\n')
+        i = 0
+        while i < len(lineas):
+            linea = lineas[i].strip()
+            if not linea:
+                i += 1
+                continue
+            if re.match(r'^\s*\d+\s+[A-Za-z]', linea):
+                partes = linea.split(maxsplit=1)
+                if len(partes) == 2:
+                    img = {
+                        'cantidad': partes[0].strip(),
+                        'descripcion': partes[1].strip(),
+                        'fecha': None,
+                        'resultado': None
+                    }
+                    for j in range(i, min(i+5, len(lineas))):
+                        if 'Fecha y Hora de Aplicación' in lineas[j]:
+                            fecha_match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})', lineas[j])
+                            if fecha_match:
+                                img['fecha'] = fecha_match.group(1)
+                                img['hora'] = fecha_match.group(2)
+                        if 'Resultados:' in lineas[j]:
+                            k = j+1
+                            resultados = []
+                            while k < len(lineas) and not re.match(r'^\s*\d+\s+[A-Za-z]', lineas[k]) and not re.match(r'\n[A-Z ]{5,}\n', lineas[k]):
+                                res_linea = lineas[k].strip()
+                                if res_linea:
+                                    resultados.append(res_linea)
+                                k += 1
+                            if resultados:
+                                img['resultado'] = ' '.join(resultados)
+                            break
+                    imagenes.append(img)
+            i += 1
+    return imagenes
 
 def extraer_interconsultas(texto):
-    # ... (mantener)
-    return []
+    """Extrae solicitudes de interconsulta."""
+    interconsultas = []
+    patron = r'INTERCONSULTA POR:\s*([^\n]+)\s+Fecha de Orden:\s*(\d{2}/\d{2}/\d{4})'
+    for match in re.finditer(patron, texto, re.IGNORECASE):
+        interconsultas.append({
+            'especialidad': match.group(1).strip(),
+            'fecha_orden': match.group(2).strip()
+        })
+    return interconsultas
 
 def extraer_evoluciones(texto):
-    # ... (mantener)
-    return []
+    """Extrae notas de evolución (fecha, médico, texto)"""
+    evoluciones = []
+    patron = r'EVOLUCION MEDICO\s*\n(.*?)(?=\n[A-Z ]{5,}\n|\Z)'
+    for match in re.finditer(patron, texto, re.DOTALL | re.IGNORECASE):
+        bloque = match.group(1).strip()
+        fecha = re.search(r'(\d{2}/\d{2}/\d{4})', bloque)
+        evoluciones.append({
+            'fecha': fecha.group(1) if fecha else None,
+            'texto': bloque
+        })
+    return evoluciones
 
 def extraer_altas(texto):
-    # ... (mantener)
-    return []
+    """Extrae información de alta médica."""
+    altas = []
+    patron = r'ALTA M[EÉ]DICA.*?(?=\n[A-Z ]{5,}\n|\Z)'
+    for match in re.finditer(patron, texto, re.DOTALL | re.IGNORECASE):
+        bloque = match.group(0)
+        fecha = re.search(r'(\d{2}/\d{2}/\d{4})', bloque)
+        altas.append({
+            'fecha': fecha.group(1) if fecha else None,
+            'info': bloque
+        })
+    return altas
 
 # ----------------------------------------------------------------------
 # Extracción mediante IA con Gemini
@@ -135,7 +430,6 @@ def extract_with_gemini(text, api_key, model_name="gemini-2.0-flash", max_chars=
     configure_gemini(api_key)
     model = genai.GenerativeModel(model_name)
     
-    # Limitar texto para evitar exceder cuotas
     if len(text) > max_chars:
         text = text[:max_chars]
         st.warning(f"El texto es muy largo, se truncó a {max_chars} caracteres para la extracción por IA.")
@@ -250,16 +544,10 @@ def extract_with_gemini(text, api_key, model_name="gemini-2.0-flash", max_chars=
     
     try:
         response = model.generate_content(prompt)
-        # Intentar parsear la respuesta como JSON
-        # A veces Gemini incluye ```json ... ```, limpiar
         content = response.text
-        # Extraer JSON si está en bloque de código
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
         if json_match:
             content = json_match.group(1)
-        else:
-            # Puede que ya sea JSON directamente
-            pass
         data = json.loads(content)
         return data
     except json.JSONDecodeError:
@@ -267,9 +555,7 @@ def extract_with_gemini(text, api_key, model_name="gemini-2.0-flash", max_chars=
         st.code(content)
         return None
     except exceptions.ResourceExhausted as e:
-        # Error 429 por cuota
         st.error(f"Límite de cuota excedido: {e}")
-        # Intentar extraer tiempo de espera del mensaje de error
         retry_match = re.search(r'retry_delay \{ seconds: (\d+) \}', str(e))
         if retry_match:
             seconds = int(retry_match.group(1))
@@ -278,6 +564,56 @@ def extract_with_gemini(text, api_key, model_name="gemini-2.0-flash", max_chars=
     except Exception as e:
         st.error(f"Error en la extracción con Gemini: {e}")
         return None
+
+# ----------------------------------------------------------------------
+# Función para análisis con IA (genérico)
+# ----------------------------------------------------------------------
+def analyze_with_gemini(data, prompt, api_key, model_name, data_format="json"):
+    """Envía datos a Gemini y retorna la respuesta textual."""
+    configure_gemini(api_key)
+    model = genai.GenerativeModel(model_name)
+    if data_format == "json":
+        data_str = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+        full_prompt = f"{prompt}\n\nDatos extraídos de la historia clínica (formato JSON):\n{data_str}"
+    else:
+        # Texto completo truncado
+        full_prompt = f"{prompt}\n\nTexto completo de la historia clínica:\n{data[:100000]}"
+    response = model.generate_content(full_prompt)
+    return response.text
+
+# ----------------------------------------------------------------------
+# Función para crear PDF del análisis
+# ----------------------------------------------------------------------
+def crear_pdf_analisis(texto_analisis, titulo="Análisis de Historia Clínica"):
+    """Genera un PDF con el texto del análisis."""
+    pdf = FPDF()
+    pdf.add_page()
+    # Usar fuente Helvetica con codificación latin-1 para caracteres acentuados
+    pdf.set_font("Helvetica", size=12)
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # Título
+    pdf.set_font("Helvetica", 'B', 16)
+    pdf.cell(200, 10, txt=titulo, ln=True, align='C')
+    pdf.ln(10)
+    
+    # Fecha
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(200, 10, txt=f"Generado el: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", ln=True, align='R')
+    pdf.ln(10)
+    
+    # Contenido
+    pdf.set_font("Helvetica", size=12)
+    # Dividir el texto en líneas y escribirlas
+    for linea in texto_analisis.split('\n'):
+        # Asegurar codificación
+        try:
+            pdf.multi_cell(0, 10, txt=linea.encode('latin-1', 'replace').decode('latin-1'))
+        except:
+            pdf.multi_cell(0, 10, txt=linea)
+    
+    # Devolver el PDF como bytes
+    return pdf.output(dest='S').encode('latin-1')
 
 # ----------------------------------------------------------------------
 # Procesamiento principal (elige método)
@@ -317,7 +653,6 @@ st.markdown("Sube un archivo PDF de una historia clínica y obtén un reporte de
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # Método de extracción
     extraction_method = st.radio(
         "Método de extracción",
         ["Reglas (rápido)", "IA (preciso, consume tokens)"],
@@ -325,7 +660,6 @@ with st.sidebar:
         help="Con IA se usa Gemini para extraer la información; puede ser más lento y requiere API key."
     )
     
-    # Configuración de IA (si se selecciona)
     if extraction_method == "IA (preciso, consume tokens)":
         st.subheader("🤖 Configuración de IA")
         if "GEMINI_API_KEY" in st.secrets:
@@ -336,7 +670,6 @@ with st.sidebar:
             if not api_key:
                 st.warning("Ingresa una API key para usar extracción por IA")
         
-        # Modelos disponibles (incluyendo gemini-2.5-flash como opción, aunque puede no existir)
         model_options = {
             "Gemini 2.0 Flash": "gemini-2.0-flash",
             "Gemini 2.0 Flash Exp": "gemini-2.0-flash-exp",
@@ -351,7 +684,7 @@ with st.sidebar:
         model_name = None
 
     st.markdown("---")
-    st.markdown("**Nota:** Asegúrate de tener la librería instalada: `pip install google-generativeai`")
+    st.markdown("**Nota:** Asegúrate de tener la librería instalada: `pip install google-generativeai fpdf2`")
 
 # Carga de archivo
 MAX_MB = 200
@@ -384,23 +717,112 @@ if archivo_subido is not None:
 
             st.success("✅ Extracción completada")
 
-            # Mostrar datos del paciente y demás secciones (igual que antes)
+            # Mostrar datos del paciente
             st.header("📋 Datos del paciente")
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Nombre", resultado['paciente'].get('nombre', 'No encontrado'))
+                st.metric("Nombre", resultado.get('paciente', {}).get('nombre', 'No encontrado'))
             with col2:
-                st.metric("Documento", resultado['paciente'].get('documento', 'No encontrado'))
+                st.metric("Documento", resultado.get('paciente', {}).get('documento', 'No encontrado'))
             with col3:
-                st.metric("Edad", resultado['paciente'].get('edad', 'No encontrado'))
+                st.metric("Edad", resultado.get('paciente', {}).get('edad', 'No encontrado'))
             with col4:
-                st.metric("Teléfono", resultado['paciente'].get('telefono', 'No encontrado'))
+                st.metric("Teléfono", resultado.get('paciente', {}).get('telefono', 'No encontrado'))
 
-            # ... (resto de secciones similar, omitidas por brevedad, pero deben incluirse)
+            # Servicios
             st.header(f"🏥 Servicios de atención ({len(resultado.get('servicios', []))})")
-            # etc.
+            for s in resultado.get('servicios', []):
+                st.write(f"- **{s.get('tipo_atencion')}** en {s.get('sede_nombre')} ({s.get('fecha')} {s.get('hora')})")
+            if not resultado.get('servicios'):
+                st.write("No se encontraron servicios.")
 
-            # JSON completo
+            # Diagnósticos
+            st.header(f"📌 Diagnósticos ({len(resultado.get('diagnosticos', []))})")
+            for d in resultado.get('diagnosticos', []):
+                st.write(f"- **{d.get('codigo')}** {d.get('descripcion')}")
+            if not resultado.get('diagnosticos'):
+                st.write("No se encontraron diagnósticos.")
+
+            # Medicamentos (resumen)
+            st.header(f"💊 Medicamentos ({len(resultado.get('medicamentos', []))})")
+            for med in resultado.get('medicamentos', []):
+                with st.expander(f"{med.get('descripcion', '')[:80]}..."):
+                    st.write(f"**Cantidad:** {med.get('cantidad')}")
+                    st.write(f"**Dosis:** {med.get('dosis')}")
+                    st.write(f"**Vía:** {med.get('via')}")
+                    st.write(f"**Frecuencia:** {med.get('frecuencia')}")
+                    st.write(f"**Estado:** {med.get('estado')}")
+            if not resultado.get('medicamentos'):
+                st.write("No se encontraron medicamentos.")
+
+            # Procedimientos
+            st.header(f"🩺 Procedimientos ({len(resultado.get('procedimientos', []))})")
+            for p in resultado.get('procedimientos', []):
+                fecha = f" ({p.get('fecha')})" if p.get('fecha') else ""
+                st.write(f"- **{p.get('descripcion')}** {fecha} – Cantidad: {p.get('cantidad')} ({p.get('tipo')})")
+            if not resultado.get('procedimientos'):
+                st.write("No se encontraron procedimientos.")
+
+            # Cirugías detalladas
+            st.header(f"🔪 Cirugías detalladas ({len(resultado.get('cirugias', []))})")
+            for c in resultado.get('cirugias', []):
+                with st.expander(f"Cirugía del {c.get('fecha', 'desconocida')}"):
+                    st.write(f"**Diagnóstico preoperatorio:** {c.get('diagnostico_pre', 'N/A')}")
+                    st.write(f"**Diagnóstico postoperatorio:** {c.get('diagnostico_post', 'N/A')}")
+                    st.write(f"**Anestesia:** {c.get('anestesia', 'N/A')}")
+                    st.write(f"**Hora inicio:** {c.get('hora_inicio', 'N/A')} – **Hora fin:** {c.get('hora_fin', 'N/A')}")
+                    st.write(f"**Descripción:** {c.get('descripcion', 'N/A')}")
+                    st.write(f"**Tejidos a patología:** {c.get('tejidos_patologia', 'N/A')}")
+                    if 'participantes' in c:
+                        st.write("**Participantes:**")
+                        for part in c['participantes']:
+                            st.write(f"  - {part.get('nombre')} ({part.get('tipo')})")
+            if not resultado.get('cirugias'):
+                st.write("No se encontraron descripciones quirúrgicas detalladas.")
+
+            # Laboratorios
+            st.header(f"🔬 Laboratorios ({len(resultado.get('laboratorios', []))})")
+            for lab in resultado.get('laboratorios', []):
+                fecha = f" ({lab.get('fecha')})" if lab.get('fecha') else ""
+                with st.expander(f"{lab.get('descripcion')}{fecha}"):
+                    st.write(f"**Cantidad:** {lab.get('cantidad')}")
+                    if lab.get('resultado'):
+                        st.write(f"**Resultado:** {lab.get('resultado')}")
+            if not resultado.get('laboratorios'):
+                st.write("No se encontraron órdenes de laboratorio.")
+
+            # Imágenes
+            st.header(f"📸 Imágenes diagnósticas ({len(resultado.get('imagenes', []))})")
+            for img in resultado.get('imagenes', []):
+                fecha = f" ({img.get('fecha')})" if img.get('fecha') else ""
+                with st.expander(f"{img.get('descripcion')}{fecha}"):
+                    st.write(f"**Cantidad:** {img.get('cantidad')}")
+                    if img.get('resultado'):
+                        st.write(f"**Resultado:** {img.get('resultado')}")
+            if not resultado.get('imagenes'):
+                st.write("No se encontraron imágenes.")
+
+            # Interconsultas
+            st.header(f"📞 Interconsultas ({len(resultado.get('interconsultas', []))})")
+            for ic in resultado.get('interconsultas', []):
+                st.write(f"- **{ic.get('especialidad')}** (orden: {ic.get('fecha_orden')})")
+            if not resultado.get('interconsultas'):
+                st.write("No se encontraron interconsultas.")
+
+            # Evoluciones (resumen)
+            st.header(f"📝 Evoluciones ({len(resultado.get('evoluciones', []))})")
+            st.write(f"Se encontraron {len(resultado.get('evoluciones', []))} notas de evolución.")
+            if not resultado.get('evoluciones'):
+                st.write("No se encontraron notas de evolución.")
+
+            # Altas
+            st.header(f"🚪 Altas ({len(resultado.get('altas', []))})")
+            for a in resultado.get('altas', []):
+                st.write(f"- Alta del {a.get('fecha')}")
+            if not resultado.get('altas'):
+                st.write("No se encontraron registros de alta.")
+
+            # JSON completo (opcional, pero lo dejamos para descarga)
             st.header("📦 JSON completo")
             json_str = json.dumps(resultado, indent=2, ensure_ascii=False, default=str)
             st.download_button(
@@ -410,8 +832,8 @@ if archivo_subido is not None:
                 mime="application/json"
             )
 
-# Sección de análisis con IA (igual que antes)
-if 'resultado' in st.session_state and extraction_method == "Reglas (rápido)":  # Solo si no se usó IA para extraer
+# Sección de análisis con IA (siempre visible si hay resultado)
+if 'resultado' in st.session_state:
     st.markdown("---")
     st.header("🤖 Análisis con Inteligencia Artificial (Gemini)")
     
@@ -437,23 +859,10 @@ if 'resultado' in st.session_state and extraction_method == "Reglas (rápido)": 
         if st.button("🚀 Analizar con IA", type="primary"):
             with st.spinner("Consultando a Gemini..."):
                 try:
-                    from google.api_core import exceptions
                     if data_format == "json":
                         data_to_send = st.session_state['resultado']
                     else:
                         data_to_send = st.session_state['texto_crudo']
-                    
-                    # Reutilizar función analyze_with_gemini (definida antes)
-                    def analyze_with_gemini(data, prompt, api_key, model_name, data_format):
-                        configure_gemini(api_key)
-                        model = genai.GenerativeModel(model_name)
-                        if data_format == "json":
-                            data_str = json.dumps(data, indent=2, ensure_ascii=False, default=str)
-                            full_prompt = f"{prompt}\n\nDatos extraídos de la historia clínica (formato JSON):\n{data_str}"
-                        else:
-                            full_prompt = f"{prompt}\n\nTexto completo de la historia clínica:\n{data[:100000]}"
-                        response = model.generate_content(full_prompt)
-                        return response.text
                     
                     response = analyze_with_gemini(
                         data=data_to_send,
@@ -462,15 +871,25 @@ if 'resultado' in st.session_state and extraction_method == "Reglas (rápido)": 
                         model_name=model_name,
                         data_format=data_format
                     )
-                    st.markdown("### Resultado del análisis")
-                    st.write(response)
                     
+                    # Mostrar el análisis en un recuadro
+                    st.markdown("### Resultado del análisis")
+                    with st.container():
+                        st.markdown(f"""
+                        <div style="border: 2px solid #4CAF50; border-radius: 10px; padding: 15px; background-color: #f9f9f9;">
+                            {response.replace(chr(10), '<br>')}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Botón para descargar como PDF
+                    pdf_bytes = crear_pdf_analisis(response, titulo="Análisis de Historia Clínica")
                     st.download_button(
-                        label="📥 Descargar análisis",
-                        data=response,
-                        file_name="analisis_gemini.txt",
-                        mime="text/plain"
+                        label="📥 Descargar análisis como PDF",
+                        data=pdf_bytes,
+                        file_name=f"analisis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf"
                     )
+                    
                 except exceptions.ResourceExhausted as e:
                     st.error(f"Límite de cuota excedido: {e}")
                     retry_match = re.search(r'retry_delay \{ seconds: (\d+) \}', str(e))
