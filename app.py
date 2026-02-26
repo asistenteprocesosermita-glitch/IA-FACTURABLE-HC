@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-===============================================================================
-SISTEMA DE AUDITORÍA DE FACTURACIÓN EN HISTORIAS CLÍNICAS
-===============================================================================
-Versión: 2.0 (Profesional)
-Autor: Auditoría Médica con IA
-Licencia: MIT
-Repositorio: https://github.com/tuusuario/lector-hc-facturacion
-
-Este programa lee archivos PDF de historias clínicas, extrae información
-estructurada mediante inteligencia artificial (Gemini) y genera un informe
-detallado de los elementos facturables según la normativa colombiana.
-===============================================================================
-"""
-
 # -----------------------------------------------------------------------------
 # 1. IMPORTACIONES Y CONFIGURACIÓN INICIAL
 # -----------------------------------------------------------------------------
